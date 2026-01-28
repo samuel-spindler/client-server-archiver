@@ -5,7 +5,7 @@ Ce projet consiste en une solution **Client-Serveur** robuste développée inté
 ## Équipe du projet
 
 Ce projet a été réalisé en équipe dans le cadre de l'UE LO14 :
-- **Samuel Spindler** : Architecture réseau, protocole de communication et implémentation des modes d'interactions.
+- **Samuel SPINDLER** : Architecture réseau, protocole de communication et implémentation des modes d'interactions.
 - **Max DIECHTIAREF--HUCK** : Gestion du format archive et implémentation du mini-shell.
 
 ## Fonctionnalités Clés
