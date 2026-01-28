@@ -2,6 +2,12 @@
 
 Ce projet consiste en une solution **Client-Serveur** robuste développée intégralement en **Bash**. Il permet de générer des archives personnalisées, de les stocker sur un serveur distant et de les manipuler via un shell virtuel interactif sans extraction préalable.
 
+## Équipe du projet
+
+Ce projet a été réalisé en équipe dans le cadre de l'UE LO14 :
+- **Samuel Spindler** : Architecture réseau, protocole de communication et implémentation des modes d'interactions.
+- **Max DIECHTIAREF--HUCK** : Gestion du format archive et implémentation du mini-shell.
+
 ## Fonctionnalités Clés
 
 - **Format d'Archive** : Structure optimisée avec un index de saut, un Header (métadonnées) et un Body (données brutes).
