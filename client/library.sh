@@ -1,0 +1,748 @@
+#! /bin/bash
+
+generate_archive() {
+    #On stocke le chemin du répertoire que l'on souhaite archiver
+    local SOURCE_DIR="$(pwd)"
+    # On définit l'endroit ou le fichier archive sera enregistré
+    local NAME_FILE="/tmp/$1"
+
+    # On définit 2 fichiers temporaire qui seront utilisé pour construire le header et le body
+    local HEADER_TMP="/tmp/header"
+    local BODY_TMP="/tmp/body"
+
+    # On écrase le contenu des fichiers temporaires si ils existent déjà
+    > "$HEADER_TMP"
+    > "$BODY_TMP"
+
+    #Compteur de lignes pouur connaître la ligne de début du body
+    local CURRENT_BODY_OFFSET=1
+    local ROOT_NAME
+    ROOT_NAME=$(basename "$SOURCE_DIR")
+
+    cd "$SOURCE_DIR" || exit 1
+
+
+    process_dir() {
+        local fs_path="$1"        # chemin réel (., ./dossier, ...)
+        local archive_path="$2"   # chemin logique (test, test/dossier, ...)
+
+        echo "directory $archive_path" >> "$HEADER_TMP"
+
+        # On liste tous les fichiers et dossiers du répertoire courant
+        for file in "$fs_path"/*; do
+            [ ! -e "$file" ] && continue
+
+	    # On récupère les informations utiles du fichier
+            local name=$(basename "$file")
+            local perms=$(stat -c "%A" "$file")
+            local size=$(stat -c "%s" "$file")
+
+	    # On complète le header avec les informations du fichier
+            if [ -d "$file" ]; then
+                echo "$name $perms $size" >> "$HEADER_TMP"
+
+            elif [ -f "$file" ]; then
+                local nb_lines=$(wc -l < "$file")
+
+                if [ "$nb_lines" -eq 0 ]; then
+                    echo "$name $perms 0" >> "$HEADER_TMP"
+                else
+                    echo "$name $perms $size $CURRENT_BODY_OFFSET $nb_lines" \
+                        >> "$HEADER_TMP"
+
+		    # On complète le body avec les informations du fichier
+                    cat "$file" >> "$BODY_TMP"
+		    # On met a jour le compteur de ligne pour la ligne de début du prochain body
+                    CURRENT_BODY_OFFSET=$((CURRENT_BODY_OFFSET + nb_lines))
+                fi
+            fi
+        done
+	
+	# On cloture le bloc
+        echo "@" >> "$HEADER_TMP"
+
+        # Récursion pour chaque sous-dossier
+        for file in "$fs_path"/*; do
+            if [ -d "$file" ]; then
+                local name=$(basename "$file")
+                process_dir "$file" "$archive_path/$name"
+            fi
+        done
+    }
+
+    # Lancement depuis le répertoire courant qui sera la racine de l'arborescence archivée
+    process_dir "." "$ROOT_NAME"
+
+    cd ..
+
+    # On compte le nombre de ligne de notre header final
+    local HEADER_LINES=$(wc -l < "$HEADER_TMP")
+    # Le header commence a la ligne 2 car la ligne 1est l'index
+    local START_HEADER=2
+    # Le body commence juste après le header
+    local START_BODY=$((HEADER_LINES + 2))
+
+    # On assemble le fichier archive final
+    echo "${START_HEADER}:${START_BODY}" > "$NAME_FILE"
+    cat "$HEADER_TMP" >> "$NAME_FILE"
+    cat "$BODY_TMP" >> "$NAME_FILE"
+
+    # On supprime les fichiers temporaires
+    rm "$HEADER_TMP" "$BODY_TMP"
+}
+
+extract_archive() {
+    local ARCHIVE_FILE="$1"
+
+    # On récupère la première ligne du fichier qui contient l'index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    # On isole la deuxième partie de l'index (la ligne ou commene le body)
+    local START_BODY=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    local END_HEADER=$((START_BODY - 1))
+    # On définit la variable qui stockera le dossier courant
+    local CURRENT_CONTEXT=""
+
+    # On extrait le header
+    sed -n "2,${END_HEADER}p" "$ARCHIVE_FILE" | while read -r line; do
+        
+        # CAS 1 : C'est une définition de répertoire
+        if echo "$line" | grep -q "^directory "; then
+            local dir_path=$(echo "$line" | cut -d' ' -f2-)
+            CURRENT_CONTEXT="$dir_path"
+            mkdir -p "$CURRENT_CONTEXT"
+            continue
+        fi
+
+        # CAS 2 : Fin de liste
+        if [ "$line" == "@" ]; then
+            continue
+        fi
+
+        # CAS 3 : C'est un fichier ou un sous-dossier
+        read -r name perms size offset length <<< "$line"
+        
+        local target_path="$CURRENT_CONTEXT/$name"
+        
+        if [[ "$perms" == d* ]]; then
+            # C'est un sous dossier
+            mkdir -p "$target_path"
+            
+        else
+            # C'est un fichier
+            if [ "$size" -eq 0 ]; then
+                touch "$target_path"
+            else
+                # Calcul des lignes pour extraire le contenu avec sed
+                local abs_start=$((START_BODY + offset - 1))
+                local abs_end=$((abs_start + length - 1))
+                sed -n "${abs_start},${abs_end}p" "$ARCHIVE_FILE" > "$target_path"
+            fi
+        fi
+
+        # On récupère les droits du fichier sur l'archive
+        local u_perm="${perms:1:3}"
+        local g_perm="${perms:4:3}"
+        local o_perm="${perms:7:3}"
+        
+	# On supprime les tirets
+        u_perm="${u_perm//-/}"
+        g_perm="${g_perm//-/}"
+        o_perm="${o_perm//-/}"
+        
+	# On applique les droits au fichier crée
+        chmod u="$u_perm",g="$g_perm",o="$o_perm" "$target_path" 2>/dev/null
+
+    done
+}
+
+mkdir_in_archive() {
+    local ARCHIVE_FILE="$1"
+    # c'est l'adresse absolue AVEC le nom du dossier à créer
+    local TARGET_PATH="$2"  
+    # On extrait le chemin du parent grâce à la fonction dirname
+    local TARGET_DIR=$(dirname "$TARGET_PATH")
+    # On extrait le nom final du dossier
+    local TARGET_NAME=$(basename "$TARGET_PATH")
+    # Fichiers temporaires pour la reconstruction de la nouvelle archive
+    local NEW_HEADER="header_mkdir.tmp"
+    local BODY_TMP="body_save.tmp"
+    > "$NEW_HEADER"
+    > "$BODY_TMP"
+    # fichier temporaire contenant le header pour la boucle while
+    local TMP_READ="header_read.tmp"
+    > "$TMP_READ"
+    # Lecture des index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    # On coupe après les ':' pour avoir le début du Body
+    local START_BODY=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    # La fin du Header est juste la ligne avant le début du Body
+    local END_HEADER=$((START_BODY - 1))
+    # On copie tout le contenu (Body) de l'archive dans un fichier à part pour ne pas le perdre
+    sed -n "${START_BODY},\$p" "$ARCHIVE_FILE" > "$BODY_TMP"
+    # Copie du header
+    sed -n "2,${END_HEADER}p" "$ARCHIVE_FILE" > "$TMP_READ"
+    # Drapeaux 
+    local IN_PARENT_DIR=0
+    local ENTRY_ADDED=0
+     while read -r line; do
+        # CAS A : Début d'un bloc répertoire
+        if echo "$line" | grep -q "^directory "; then
+            local current_dir=$(echo "$line" | cut -d' ' -f2-)
+            # Est-ce le répertoire parent où on veut créer le dossier ?
+            if [ "$current_dir" == "$TARGET_DIR" ]; then
+                # Si oui on retient que l'on est dans le bon repertoire 
+                IN_PARENT_DIR=1
+            else
+                IN_PARENT_DIR=0
+            fi
+            # Si le dossier qu'on veut créer existe déjà comme bloc principal -> erreur
+            if [ "$current_dir" == "$TARGET_PATH" ]; then
+                echo "Erreur: Le dossier $TARGET_PATH existe déjà."
+                rm "$NEW_HEADER" "$BODY_TMP"
+                return 1
+            fi  
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+        # CAS B : Fin d'un bloc (@)
+        if [ "$line" == "@" ]; then
+            # Si on est dans le bon dossier parent et qu'on a pas encore ajouté
+            if [ "$IN_PARENT_DIR" -eq 1 ] && [ "$ENTRY_ADDED" -eq 0 ]; then
+                # Format dossier : Nom Droits(drwxr-xr-x) Taille(0)
+                echo "$TARGET_NAME drwxr-xr-x 0" >> "$NEW_HEADER"
+                ENTRY_ADDED=1
+            fi  
+            # On met le @ de fin dans le nouveau header
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+        local existing_name=$(echo "$line" | awk '{print $1}')
+        # CAS C : Vérification doublon (Fichier/Dossier existant dans la liste)
+        if [ "$IN_PARENT_DIR" -eq 1 ] && [ "$existing_name" == "$TARGET_NAME" ]; then
+            echo "Erreur: Une entrée nommée $TARGET_NAME existe déjà dans $TARGET_DIR."
+            rm "$NEW_HEADER" "$BODY_TMP" "$TMP_READ"
+            return 1
+        fi
+        echo "$line" >> "$NEW_HEADER"
+    done < "$TMP_READ"
+    # Vérification que le parent existait bien et donc que l'entré à bien été effectuée
+    if [ "$ENTRY_ADDED" -eq 0 ]; then
+        echo "Erreur: Le dossier parent '$TARGET_DIR' n'existe pas."
+        rm "$NEW_HEADER" "$BODY_TMP" "$TMP_READ"
+        return 1
+    fi
+    # Pour mkdir, il faut créer la définition du nouveau dossier à la fin du header
+    echo "directory $TARGET_PATH" >> "$NEW_HEADER"
+    echo "@" >> "$NEW_HEADER"
+    # Assemblage final : nouvel header a 2 lignes supplémentaires et le body commence deux lignes après le nombre de lignes du body
+    local NEW_HEADER_LINES=$(wc -l < "$NEW_HEADER")
+    local NEW_START_BODY=$((NEW_HEADER_LINES + 2))
+    echo "2:$NEW_START_BODY" > "$ARCHIVE_FILE"
+    # Concaténation
+    cat "$NEW_HEADER" >> "$ARCHIVE_FILE"
+    cat "$BODY_TMP" >> "$ARCHIVE_FILE"   
+    # Suppression des fichiers temporaires
+    rm "$NEW_HEADER" "$BODY_TMP" "$TMP_READ"
+    echo "Dossier $TARGET_PATH créé avec succès."
+}
+
+cat_from_archive() {
+    local ARCHIVE_FILE="$1"
+    local TARGET_PATH="$2"
+    # On sépare le chemin de l'emplacement
+    local TARGET_DIR=$(dirname "$TARGET_PATH")
+    # Le nom du fichier
+    local TARGET_NAME=$(basename "$TARGET_PATH")
+    # Fichier temporaire contenant le header pour la boucle while
+    local TEMP_LIST="cat_header_read.tmp"
+    # Lecture des index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    local START_BODY=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    local END_HEADER=$((START_BODY - 1))
+    sed -n "2,${END_HEADER}p" "$ARCHIVE_FILE" > "$TEMP_LIST"
+    #Drapeau d'etat pour la recherche
+    local IN_DIR=0
+
+    while read -r line; do
+        # Si on trouve un dossier donc une ligne qui commence par directory
+        if echo "$line" | grep -q "^directory "; then
+            # On met à jour la position virtuelle dans l'archive
+            local current_dir=$(echo "$line" | cut -d' ' -f2-)
+            # On teste si c'est le dossier qui contient le fichier à afficher
+            if [ "$current_dir" == "$TARGET_DIR" ]; then
+                # si oui on active la recherche
+                IN_DIR=1 
+            else
+                IN_DIR=0
+            fi
+            continue
+        fi
+        # si c'est une fin de bloc
+        if [ "$line" == "@" ]; then
+            # Et si on était dans le bon dossier et qu'on sort sans avoir trouvé, on arrête
+            if [ "$IN_DIR" -eq 1 ]; then break; fi
+            continue
+        fi
+        # Si on est dans le bon dossier, on analyse les fichiers
+        if [ "$IN_DIR" -eq 1 ]; then
+            # On découpe la ligne en nom permission taille offset et longueur
+            read -r name perms size offset length <<< "$line"
+            # Si c'est le bon fichier à afficher
+            if [ "$name" == "$TARGET_NAME" ]; then
+                # Test si c'est pas un repertoire
+                if [[ "$perms" == d* ]]; then
+                    echo "cat: $TARGET_NAME: Is a directory"
+                    return 1
+                fi
+                # Sinon on peut afficher le contenu si le fichier n'est pas vide
+                if [ "$size" -gt 0 ]; then
+                    # On caclule les lignes de début et de fin dans le fichier archive complet.
+                    local abs_start=$((START_BODY + offset - 1))
+                    local abs_end=$((abs_start + length - 1))
+                    # Et on extrait alors cette partie du body
+                    sed -n "${abs_start},${abs_end}p" "$ARCHIVE_FILE"
+                fi
+                # Code retour pour la gestion d'erreur
+                return 0 
+            fi
+        fi
+    done < "$TEMP_LIST"
+    # Si on arrive ici, fichier non trouvé
+    echo "cat: $(basename "$TARGET_PATH"): No such file or directory"
+    # Suppression du fichier temporaire
+    rm "$TEMP_LIST"
+    return 1
+}
+
+# Usage: list_archive_content "archive" "chemin_interne" "mode_long(0/1)" "mode_all(0/1)"
+list_archive_content() {
+    local ARCHIVE_FILE="$1"
+    local TARGET_DIR="$2"
+    local AFFICHAGE_ET="$3"  # 1 = oui, 0 = non
+    local AFFICHAGE_CACHE="$4"   # 1 = oui (afficher cachés), 0 = non
+    # Fichier temporaire pour le while 
+    local TEMP_LIST="ls_header_read.tmp"
+    # Lectrure des index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    local START_BODY=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    local END_HEADER=$((START_BODY - 1))
+    #On extrait le Header dans le fichier temporaire
+    sed -n "2,${END_HEADER}p" "$ARCHIVE_FILE" > "$TEMP_LIST"
+
+    # Petite vérification rapide pour voir si le dossier existe avant de boucler
+    if ! grep -q "^directory $TARGET_DIR$" "$ARCHIVE_FILE"; then
+        echo "ls: impossible d'accéder à '$TARGET_DIR': Aucun fichier ou dossier de ce type"
+        rm "$TEMP_LIST"
+        return 1
+    fi
+    # On utilise une variable drapeau PRINT_MODE pour savoir si on est dans le bon dossier
+    local PRINT_MODE=0
+    while read -r line; do
+        # Détection du dossier
+        if echo "$line" | grep -q "^directory "; then
+            # On met à jour la position virtuelle
+            local current_dir=$(echo "$line" | cut -d' ' -f2-)
+            # Si on est dans le bon dossier à afficher : 
+            if [ "$current_dir" == "$TARGET_DIR" ]; then
+                PRINT_MODE=1
+            else
+                PRINT_MODE=0
+            fi
+            continue
+        fi
+        if [ "$line" == "@" ]; then
+            if [ "$PRINT_MODE" -eq 1 ]; then
+                # On a fini d'afficher le dossier, on sort
+                break 
+            fi
+            continue
+        fi
+        # Affichage des entrées
+        if [ "$PRINT_MODE" -eq 1 ]; then
+            # On découpe la ligne
+            read -r name perms size offset length <<< "$line"
+            # Si le nom commence par "." et que SHOW_ALL est 0, on cache
+            if [[ "$name" == .* ]] && [ "$AFFICHAGE_CACHE" -eq 0 ]; then
+                continue
+            fi
+            # Filtre affichage détaillé
+            if [ "$AFFICHAGE_ET" -eq 1 ]; then
+                printf "%-12s %-8s %s\n" "$perms" "$size" "$name"
+            else
+                echo "$name"
+            fi
+        fi
+    done < "$TEMP_LIST"
+    # suppression du fichier temporaire
+    rm "$TEMP_LIST"
+}
+
+delete_from_archive() {
+    local ARCHIVE_FILE="$1"
+    # Chemin complet dans l'archive (ex: test/dossier)
+    local TARGET_PATH="$2"  
+    # Fichiers temporaires pour la reconstruction du fichier archive
+    local NEW_HEADER="header_rm.tmp"
+    local NEW_BODY="body_rm.tmp"
+    # Fichier contennant le header pour la boucle while
+    local TEMP_LIST="liste.tmp"
+    # On vide les fichier par sécurité
+    > "$NEW_HEADER"
+    > "$NEW_BODY"
+    #Index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    local START_BODY_OLD=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    local END_HEADER_OLD=$((START_BODY_OLD - 1))
+    # On extrait le header pour le parcourir
+    sed -n "2,${END_HEADER_OLD}p" "$ARCHIVE_FILE" > "$TEMP_LIST"
+    local CURRENT_CONTEXT=""
+    # Compteur pour le nouveau body
+    local CURRENT_BODY_OFFSET=1 
+    local FOUND_TARGET=0
+    while read -r line; do
+        # CAS 1 : Ligne directory
+        if echo "$line" | grep -q "^directory "; then
+            local dir_path=$(echo "$line" | cut -d' ' -f2-)
+            # On met à jour la position virtuelle
+            CURRENT_CONTEXT="$dir_path"
+            # Si le dossier est celui qu'on supprime ou un de ses enfants 
+            if [[ "$dir_path" == "$TARGET_PATH" ]] || [[ "$dir_path" == "$TARGET_PATH"/* ]]; then
+                FOUND_TARGET=1
+                # si on a trouvé la ligne directory à supprimer on ne la recopie pas dans le nouveau header
+                continue
+            fi
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+
+        # CAS 2 : Fin de bloc "@"
+        if [ "$line" == "@" ]; then
+            # Si on est dans un dossier supprimé, on n'écrit pas le @
+            if [[ "$CURRENT_CONTEXT" == "$TARGET_PATH" ]] || [[ "$CURRENT_CONTEXT" == "$TARGET_PATH"/* ]]; then
+                continue
+            fi
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+
+        # CAS 3 : Entrée Fichier ou Dossier
+        # On décortique la ligne
+        read -r name perms size offset length <<< "$line"
+        local full_item_path="$CURRENT_CONTEXT/$name"
+        # Vérification si c'est l'élément à supprimer si c'est le fichier cible ou le descendant du dossier cible
+        if [[ "$full_item_path" == "$TARGET_PATH" ]] || [[ "$full_item_path" == "$TARGET_PATH"/* ]]; then
+            FOUND_TARGET=1
+            # On ne recopie pas
+            continue
+        fi
+        # Si c'est un dossier (pas de contenu dans le body), on copie juste le header
+        if [[ "$perms" == d* ]]; then
+            echo "$name $perms $size" >> "$NEW_HEADER"
+        else  
+            # Si c'est un fichier vide pas besoin de mettre d'offset et taille          
+            if [ "$size" -eq 0 ]; then
+                echo "$name $perms 0" >> "$NEW_HEADER"
+            else
+                echo "$name $perms $size $CURRENT_BODY_OFFSET $length" >> "$NEW_HEADER"
+                # On calcule où étaient les données dans l'ancien fichier
+                local abs_start=$((START_BODY_OLD + offset - 1))
+                local abs_end=$((abs_start + length - 1))
+                # On extrait ces données et on les ajoute au NOUVEAU body
+                sed -n "${abs_start},${abs_end}p" "$ARCHIVE_FILE" >> "$NEW_BODY"
+                # On met à jour le compteur (car les données se décalent)
+                CURRENT_BODY_OFFSET=$((CURRENT_BODY_OFFSET + length))
+            fi
+        fi
+
+    done < "$TEMP_LIST" 
+    # Si on n'a rien trouvé à supprimer
+    if [ "$FOUND_TARGET" -eq 0 ]; then
+        echo "Erreur : '$TARGET_PATH' introuvable dans l'archive."
+        rm "$NEW_HEADER" "$NEW_BODY" "$TEMP_LIST"
+        return 1 #Code retour gérer les erreurs 
+    fi
+    # Assemblage final (comme pour mkdir)
+    local HEADER_LINES=$(wc -l < "$NEW_HEADER")
+    local NEW_START_BODY=$((HEADER_LINES + 2))
+    echo "2:$NEW_START_BODY" > "$ARCHIVE_FILE"
+    cat "$NEW_HEADER" >> "$ARCHIVE_FILE"
+    cat "$NEW_BODY" >> "$ARCHIVE_FILE"
+    # Suppression des fichiers temporaires
+    rm "$NEW_HEADER" "$NEW_BODY" "$TEMP_LIST"
+    echo "Succès : '$TARGET_PATH' a été supprimé."
+}
+
+touch_in_archive() {
+    # chemin de l'archive téléchargée
+    local ARCHIVE_FILE="$1"
+    # chemin abolue de l'emplacement de création AVEC le nom de fichier
+    # ex: test/dossier/mon_fichier.txt
+    local TARGET_PATH="$2"  
+    #On sépare le chemin de l'emplacement
+    local TARGET_DIR=$(dirname "$TARGET_PATH")
+    # Du nom du fichier à créer
+    local TARGET_NAME=$(basename "$TARGET_PATH")  
+    # Fichiers temporaires
+    local NEW_HEADER="header_touch.tmp"
+    local BODY_TMP="body_save.tmp"
+    # Fichier permettant de lire le contenu du header dans la boucle while
+    local TEMP_LIST="liste.tmp"
+    > "$NEW_HEADER"
+    # Lecture des index
+    local INDEX_LINE=$(head -n 1 "$ARCHIVE_FILE")
+    local START_BODY=$(echo "$INDEX_LINE" | cut -d':' -f2)
+    local END_HEADER=$((START_BODY - 1))
+    # Sauvegarde du body
+    # Comme touch crée un fichier vide, on n'a pas besoin de modifier le body,
+    # juste de le conserver tel quel.
+    sed -n "${START_BODY},\$p" "$ARCHIVE_FILE" > "$BODY_TMP"
+    # Header pour la boucle While
+    sed -n "2,${END_HEADER}p" "$ARCHIVE_FILE" > "$TEMP_LIST"
+    # Variables d'état
+    local IN_TARGET_DIR=0
+    #drapeau pour savoir si on a fait le travail
+    local FILE_CREATED=0
+    while read -r line; do
+        # On détecte dans quel dossier on est
+        if echo "$line" | grep -q "^directory "; then
+            # On met à jour la position virtuelle
+            local current_dir=$(echo "$line" | cut -d' ' -f2-)
+            # Test si on est dans le dossier cible
+            if [ "$current_dir" == "$TARGET_DIR" ]; then
+                IN_TARGET_DIR=1
+            else
+                IN_TARGET_DIR=0
+            fi
+            # On ajoute toute les lignes directory dans le nouveau header
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+
+        # On détecte la fin du bloc (@)
+        if [ "$line" == "@" ]; then
+            # C'est ici qu'on insère le fichier si on est dans le bon dossier
+            if [ "$IN_TARGET_DIR" -eq 1 ] && [ "$FILE_CREATED" -eq 0 ]; then
+                echo "$TARGET_NAME -rw-r--r-- 0" >> "$NEW_HEADER"
+                # On sait alorsqu'on a bien créer le fichier
+                FILE_CREATED=1
+            fi
+            #On remet bien les @
+            echo "$line" >> "$NEW_HEADER"
+            continue
+        fi
+        
+        # Vérification doublon 
+        # On lit le nom (premier mot de la ligne)
+        local existing_name=$(echo "$line" | awk '{print $1}')
+        if [ "$IN_TARGET_DIR" -eq 1 ] && [ "$existing_name" == "$TARGET_NAME" ]; then
+            echo "Erreur: Le fichier $TARGET_PATH existe déjà."
+            rm "$NEW_HEADER" "$BODY_TMP" "$TEMP_LIST"
+            return 1
+        fi
+        # Sinon on recopie la ligne existante
+        echo "$line" >> "$NEW_HEADER"
+
+    done < "$TEMP_LIST"
+    # Vérification de la création du fichier
+    if [ "$FILE_CREATED" -eq 0 ]; then
+        echo "Erreur: Le dossier parent '$TARGET_DIR' n'existe pas."
+        rm "$NEW_HEADER" "$BODY_TMP" "$TEMP_LIST"
+        return 1
+   fi
+    # Assemblage Final
+    local NEW_HEADER_LINES=$(wc -l < "$NEW_HEADER")
+    local NEW_START_BODY=$((NEW_HEADER_LINES + 2))
+    echo "2:$NEW_START_BODY" > "$ARCHIVE_FILE"
+    cat "$NEW_HEADER" >> "$ARCHIVE_FILE"
+    
+    # Ajout Body
+    cat "$BODY_TMP" >> "$ARCHIVE_FILE"
+    #Suppression des fichiers temporaires
+    rm "$NEW_HEADER" "$BODY_TMP" "$TEMP_LIST"
+    echo "Fichier $TARGET_PATH créé avec succès."
+}
+
+sync_to_server() {
+    # Cette fonction permet d'envoyer le nouveau fichier archive au serveuur lorsqu'une modification est apportée
+    (echo "create $ARCH_NAME"; cat "/tmp/$ARCH_NAME") | nc -w 1 "$HOST" "$PORT"
+}
+
+resolve_path() {
+    local chemin_utilisateur="$1"
+    #chemin_brut sera le chemin que l'on va décortiquer
+    local chemin_brut=""
+    #Si le chemin_ut commence par / alors on suppose qu'il part de la racine
+    if [[ "$chemin_utilisateur" == /* ]]; then
+        chemin_brut="${chemin_utilisateur#/}" # permet d'enlever le premier slash
+    else
+        # Chemin relatif : on colle "Dossier Actuel" + "/" + "Demande"
+        #Mais si il est déjà à la racine, pas besoin de coller
+        if [ -z "$VIRTUAL_PWD" ]; then
+            chemin_brut="$chemin_utilisateur"
+        else
+            chemin_brut="$VIRTUAL_PWD/$chemin_utilisateur"
+        fi
+    fi
+    #On nettoie 
+    local resultat=""
+    # On remplace les slashs par des espaces pour pouvoir faire une boucle for dessus
+    # tr '/' ' ' change "a/b/c" en "a b c"
+    local liste_dossiers=$(echo "$chemin_brut" | tr '/' ' ')
+
+    for dossier in $liste_dossiers; do
+        # CAS ".." : On reculle
+        if [ "$dossier" == ".." ]; then
+            if [ -n "$resultat" ]; then
+                # Si on est déjà dans un dossier (donc resultat non null)
+                # On supprime le dernier dossier du résultat grâce à dirname
+                resultat=$(dirname "$resultat")
+                # Mais si on est déjà à la racine on met juste .
+                if [ "$resultat" == "." ]; then resultat=""; fi
+            fi
+        # Si c'est un . cela veut dire que c'est le début donc on passe   
+        elif [ "$dossier" == "." ]; then
+            continue
+        # Sinon c'est un nouveau dossier a ajouter au chemin "resultat"
+        else
+            if [ -z "$resultat" ]; then
+                resultat="$dossier"
+            else
+                resultat="$resultat/$dossier"
+            fi
+        fi
+    done
+    RESOLVED_PATH="$resultat"
+}
+
+
+do_rm() {
+    local user_arg="$1"
+    #On verifie qu'il y ait bien un argument
+    if [ -z "$user_arg" ]; then
+        echo "Usage: rm <fichier_ou_dossier>"
+        return 1
+    fi
+    # Transfomation en chemin absolue
+    resolve_path "$user_arg"
+    local target="$RESOLVED_PATH"
+
+    # Si target est vide, ça veut dire que l'utilisateur a demandé "rm ." à la racine
+    # ou quelque chose qui mène à la racine. On interdit de supprimer toute l'archive.
+    if [ -z "$target" ]; then
+        echo "Erreur : Impossible de supprimer la racine de l'archive."
+        return 1
+    fi
+
+    # Si l'utilisateur essaie de supprimer le dossier dans lequel il se trouve (ou un parent)
+    if [[ "$VIRTUAL_PWD" == "$target" ]] || [[ "$VIRTUAL_PWD" == "$target"/* ]]; then
+        echo "Attention : Vous supprimez le répertoire courant ou un parent."
+        echo "Retour à la racine..."
+        VIRTUAL_PWD=""
+    fi
+    # Appel de la fonction principale
+    delete_from_archive "/tmp/$ARCH_NAME" "$target"
+    if [ $? -eq 0 ]; then
+        echo "Suppression effectuée."
+    else
+        echo "Modification locale échouée, rien n'a été envoyé au serveur."       
+    fi
+}
+
+do_mkdir() {
+    local target_arg="$1"
+    #On verifie qu'il y ait bien un argument
+    if [ -z "$target_arg" ]; then
+        echo "Usage: mkdir <nom_dossier>"
+        return 1
+    fi
+    # Transfomation en chemin absolue
+    resolve_path "$target_arg"
+    local target="$RESOLVED_PATH"
+    # On appel la fonction principale
+    mkdir_in_archive "/tmp/$ARCH_NAME" "$target"
+    # En fonction du code retour 0 ou 1 on sait si la fonction a échoué ou non
+    if [ $? -eq 0 ]; then
+        echo "Dossier créé avec succès"
+    else
+        echo "Modification locale échouée, rien n'a été envoyé au serveur."
+    fi
+}
+
+do_cd() {
+    local target_arg="$1"
+    
+    # On calcule où l'utilisateur veut aller
+    resolve_path "$target_arg"
+    local candidat="$RESOLVED_PATH"
+    if [ -n "$ROOT_NAME" ] && [[ "$candidat" != "$ROOT_NAME"* ]]; then
+        VIRTUAL_PWD="$ROOT_NAME"
+        return 1
+    fi
+    
+    # On cherche "directory mon/chemin" dans le header de l'archive locale
+    if grep -q "^directory $candidat$" "/tmp/$ARCH_NAME"; then
+        VIRTUAL_PWD="$candidat"
+    else
+        echo "Erreur : le répertoire '$target_arg' n'existe pas."
+    fi
+}
+
+do_touch() {
+    local target_arg="$1"
+    
+    if [ -z "$target_arg" ]; then
+        echo "Erreur: nom de fichier manquant."
+        return 1
+    fi
+    resolve_path "$target_arg"
+    touch_in_archive "/tmp/$ARCH_NAME" "$RESOLVED_PATH"
+}
+
+do_ls() {
+    # Variables pour les options
+    local show_long=0
+    local show_all=0
+    local user_path=""
+    #on gère les différente possibilité que ce soit -al ou -la...
+    for arg in "$@"; do
+        # On regarde d'abord si une option est spécifiée
+        if [[ "$arg" == -* ]]; then
+            #puis on vérifie la présence du l et du a
+            if [[ "$arg" == *"l"* ]]; then
+                show_long=1
+            fi
+            if [[ "$arg" == *"a"* ]]; then
+                show_all=1
+            fi
+        else
+            user_path="$arg"
+        fi
+    done
+    local target=""
+    if [ -z "$user_path" ]; then
+        target="$VIRTUAL_PWD"
+    else
+        #transformation en chemin absolue
+        resolve_path "$user_path"
+        target="$RESOLVED_PATH"
+    fi
+    #on appelle la fonction principale
+    list_archive_content "/tmp/$ARCH_NAME" "$target" "$show_long" "$show_all"
+}
+
+do_cat() {
+    #verification de la présence d'au moins un argument
+    if [ $# -eq 0 ]; then
+        echo "Usage: cat <fichier1> [fichier2 ...]"
+        return 1
+    fi
+    #Pour chaque argument (fichier à afficher)
+    for arg in "$@"; do
+        #on transforme le chemin en chemin absolue
+        resolve_path "$arg"
+        local target="$RESOLVED_PATH"
+        #puis on appelle la fonction principale
+        cat_from_archive "/tmp/$ARCH_NAME" "$target"
+    done
+}
+
