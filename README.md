@@ -4,7 +4,7 @@ Ce projet consiste en une solution **Client-Serveur** robuste développée inté
 
 ## Équipe du projet
 
-Ce projet a été réalisé en équipe dans le cadre de l'UE LO14 :
+Ce projet a été réalisé en équipe dans le cadre de l'UE LO14 en première année de spécialisation Réseaux & Télécommunications:
 - **Samuel SPINDLER** : Architecture réseau, protocoles de communications et implémentation des modes d'interactions.
 - **Max DIECHTIAREF--HUCK** : Gestion du format archive et implémentation du mini-shell.
 
